@@ -23,9 +23,9 @@ const supabase = createClient(
 );
 
 async function cleanupOldImages() {
-  const THIRTY_DAYS_AGO = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-  const cutoffDate = THIRTY_DAYS_AGO.toISOString();
-  const cutoffMs = THIRTY_DAYS_AGO.getTime();
+  const SEVEN_DAYS_AGO = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+  const cutoffDate = SEVEN_DAYS_AGO.toISOString();
+  const cutoffMs = SEVEN_DAYS_AGO.getTime();
 
   console.log('[cleanup] 開始:', cutoffDate);
 
