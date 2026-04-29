@@ -94,26 +94,39 @@ async function splitImage(
   return cells;
 }
 
-function buildPrompt(cols: number, rows: number, userRequest?: string): string {
+function buildPrompt(cols: number, rows: number, numPersonPhotos: number, userRequest?: string): string {
   const total = cols * rows;
+
+  // 各入力画像の役割を明示（AIが何がどの画像かを正確に理解できるよう）
+  const personRange = numPersonPhotos === 1
+    ? `image 2 (person_0.jpg) is`
+    : `images 2 to ${numPersonPhotos + 1} (person_0.jpg … person_${numPersonPhotos - 1}.jpg) are`;
+  const imageRoles = [
+    `IMAGE ROLES — follow these assignments strictly:`,
+    `• image 1 (background.jpg): the LOCATION photo. This defines the scene, environment, architecture, lighting, time of day, and atmosphere. Do NOT change any of these.`,
+    numPersonPhotos > 0
+      ? `• ${personRange} PERSON REFERENCE photo(s). Use ALL of them to faithfully reconstruct this specific individual — match their face shape, eyes, nose, mouth, skin tone, hair color, hairstyle, and body proportions EXACTLY. This person must appear identically across every panel.`
+      : null,
+    `• last image (frame.jpg): the ${cols}×${rows} GRID TEMPLATE with alternating orange and teal cells. Each cell defines one output panel boundary — do not let content bleed between cells.`,
+  ].filter(Boolean).join(' ');
+
   const lines = [
-    // 入力構成の説明
-    `You are given: (1) a background location photo, (2) one or more person reference photos, (3) a ${cols}×${rows} checkerboard frame template with alternating orange and teal cells.`,
+    imageRoles,
 
     // 出力品質（入力画像は圧縮済みだが出力は最高品質で）
     `Generate a single ultra-high-quality, sharp, detailed photorealistic image at maximum fidelity — the input reference photos may be low resolution, but the output must be rendered at the highest possible quality and detail.`,
 
     // グリッド構造
-    `The output must exactly fill the ${cols}×${rows} grid defined by the checkerboard frame — each colored cell becomes one distinct scene panel, for a total of ${total} panels.`,
+    `The output must exactly fill the ${cols}×${rows} grid — each colored cell in the frame template becomes one distinct scene panel, for a total of ${total} panels.`,
 
     // 人物と背景（背景のシチュエーションは極力変えない）
-    `Each panel must show the person from the reference photos naturally present at the SAME location shown in the background photo. Preserve the background scenery, architecture, lighting, time of day, weather, and atmosphere as faithfully as possible — do NOT replace, alter, or reimagine the environment.`,
+    `Each panel must show the person naturally present at the SAME location. Preserve the background scenery, architecture, lighting, time of day, weather, and atmosphere exactly as in background.jpg — do NOT replace, alter, or reimagine the environment.`,
 
     // ポーズのバリエーション（現実的・写真的なバリエーション）
-    `Across all ${total} panels, present diverse and natural pose variations as if taken during a real photo session at that location: vary standing, sitting, crouching, walking, looking in different directions, interacting naturally with the surroundings, and shoot from different distances (close-up portrait, mid-shot, full-body). Every panel must show a clearly different pose or moment.`,
+    `Across all ${total} panels, present diverse and natural pose variations as if shot during a professional photo session at that location: vary standing, sitting, crouching, walking, looking in different directions, interacting naturally with the surroundings, and use different camera distances (close-up portrait, mid-shot, full-body). Every panel must show a clearly different pose or moment.`,
 
-    // 人物の一貫性
-    `The person's face, hair, build, and overall appearance must closely and consistently match the reference photos in every panel.`,
+    // 人物の一貫性（再現性の強調）
+    `CRITICAL: The person's identity must be consistent and faithful in every single panel. Reproduce the face, skin tone, hair, and body with high accuracy from the reference photos. Do not generalize or average their appearance — match this specific individual.`,
 
     // リアリズム厳守（非現実的な描写はNG）
     `All panels must look exactly like genuine photographs shot by a professional photographer at that real location — no illustrations, no paintings, no CGI, no stylized or surreal elements, no fantasy or impossible poses. The output must be completely indistinguishable from real photographs.`,
@@ -261,7 +274,7 @@ router.post('/', async (req: Request, res: Response) => {
     const response = await openai.images.edit({
       model: 'gpt-image-2',
       image: imageInputs as any,
-      prompt: buildPrompt(grid.cols, grid.rows, sanitizedRequest),
+      prompt: buildPrompt(grid.cols, grid.rows, personFiles.length, sanitizedRequest),
       n: 1,
       size: grid.size,
     });
