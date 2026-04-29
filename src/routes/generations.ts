@@ -17,17 +17,18 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 );
 
-// フレーム画像: backend/assets/ (src/routes からの相対 = ../../assets/)
+// フレーム画像: backend/assets/
 const ASSETS = path.join(__dirname, '../../assets');
-const FRAME_WIDE   = path.join(ASSETS, 'frame-wide.jpg');   // 4列×2行
-const FRAME_HEIGHT = path.join(ASSETS, 'frame-height.jpg'); // 2列×4行
+const FRAME_SQUARE = path.join(ASSETS, 'frame-square.jpg'); // 2列×2行（無料プラン）
+const FRAME_WIDE   = path.join(ASSETS, 'frame-wide.jpg');   // 4列×2行（有料・横長）
+const FRAME_HEIGHT = path.join(ASSETS, 'frame-height.jpg'); // 2列×4行（有料・縦長）
 
-// 有料プラン用グリッド
+// 無料プラン: 2×2 正方形 → 4枚出力
+const GRID_FREE   = { cols: 2, rows: 2, size: '1024x1024' as const, w: 1024, h: 1024 };
+// 有料プラン: 横長選択 → 4×2 → 8枚出力
 const GRID_WIDE   = { cols: 4, rows: 2, size: '1536x1024' as const, w: 1536, h: 1024 };
+// 有料プラン: 縦長選択 → 2×4 → 8枚出力
 const GRID_HEIGHT = { cols: 2, rows: 4, size: '1024x1536' as const, w: 1024, h: 1536 };
-// 無料プラン用グリッド（出力サイズを1024×1024に抑えてAPIコスト削減）
-const GRID_WIDE_FREE   = { cols: 4, rows: 2, size: '1024x1024' as const, w: 1024, h: 1024 };
-const GRID_HEIGHT_FREE = { cols: 2, rows: 4, size: '1024x1024' as const, w: 1024, h: 1024 };
 
 // 入力画像をAPI送信前に最大maxPxにリサイズ（全プラン共通・コスト削減）
 async function resizeForApi(buf: Buffer, maxPx = 512): Promise<Buffer> {
@@ -40,7 +41,7 @@ async function resizeForApi(buf: Buffer, maxPx = 512): Promise<Buffer> {
     .toBuffer();
 }
 
-// 8分割 + オプションで2倍アップスケール
+// 分割 + オプションで2倍アップスケール
 async function splitImage(
   buf: Buffer,
   cols: number,
@@ -88,12 +89,14 @@ function buildPrompt(cols: number, rows: number): string {
 }
 
 router.post('/', async (req: Request, res: Response) => {
-  const { userId, personId, inputImageBase64, personPhotoBase64s, deviceId } = req.body as {
+  const { userId, personId, inputImageBase64, personPhotoBase64s, deviceId, orientation } = req.body as {
     userId: string | null;
     personId: string | null;
     inputImageBase64: string;
     personPhotoBase64s: string[];
     deviceId: string;
+    // 有料プランのみ使用: 'landscape' | 'portrait'（無料プランは常にsquare）
+    orientation: 'landscape' | 'portrait' | null;
   };
 
   if (!inputImageBase64 || !deviceId) {
@@ -124,7 +127,8 @@ router.post('/', async (req: Request, res: Response) => {
       ? await supabase.from('profiles').select('plan').eq('id', userId).single()
       : { data: null };
 
-    const limits: Record<string, number> = { free: 3, ume: 10, take: 20, matsu: 50 };
+    // 無料プランの制限: 月1回
+    const limits: Record<string, number> = { free: 1, ume: 10, take: 20, matsu: 50 };
     const plan = profile?.plan ?? 'free';
     const currentCount = usageRow?.count ?? 0;
     const limit = limits[plan];
@@ -137,20 +141,25 @@ router.post('/', async (req: Request, res: Response) => {
     // 無料プラン判定（ゲスト or ログイン済みfreeプラン）
     const isFree = !userId || plan === 'free';
 
-    // ── 入力画像の縦横判定 ──────────────────────────────────────
+    // ── グリッド・フレーム決定 ────────────────────────────────────
+    // 無料: 正方形2×2（4枚）/ 有料: ユーザー選択の横長or縦長（8枚）
+    let grid: typeof GRID_FREE | typeof GRID_WIDE | typeof GRID_HEIGHT;
+    let framePath: string;
+
+    if (isFree) {
+      grid = GRID_FREE;
+      framePath = FRAME_SQUARE;
+    } else if (orientation === 'landscape') {
+      grid = GRID_WIDE;
+      framePath = FRAME_WIDE;
+    } else {
+      // デフォルトは縦長
+      grid = GRID_HEIGHT;
+      framePath = FRAME_HEIGHT;
+    }
+
+    // ── 場所写真を Storage 保存（オリジナルサイズで保存）──────────
     const inputBuffer = Buffer.from(inputImageBase64, 'base64');
-    const { width: imgW = 1, height: imgH = 1 } = await sharp(inputBuffer).metadata();
-
-    // 縦長入力 → wideフレーム (4×2 → 各セルが縦長)
-    // 横長入力 → heightフレーム (2×4 → 各セルが横長)
-    const isPortrait = imgH >= imgW;
-    // 無料プランは1024×1024出力でAPIコスト削減
-    const grid      = isPortrait
-      ? (isFree ? GRID_WIDE_FREE   : GRID_WIDE)
-      : (isFree ? GRID_HEIGHT_FREE : GRID_HEIGHT);
-    const framePath = isPortrait ? FRAME_WIDE  : FRAME_HEIGHT;
-
-    // ── 場所写真を Storage 保存 ──────────────────────────────────
     const ts = Date.now();
     const uid = userId ?? 'trial';
     const inputPath = `${uid}/${ts}_input.jpg`;
@@ -209,7 +218,7 @@ router.post('/', async (req: Request, res: Response) => {
     await supabase.storage.from('output-images')
       .upload(collagePath, collageBuffer, { contentType: 'image/jpeg' });
 
-    // ── 8分割 & アップスケール ──────────────────────────────────
+    // ── 分割 & アップスケール ───────────────────────────────────
     const cellBuffers = await splitImage(collageBuffer, grid.cols, grid.rows, grid.w, grid.h);
 
     const splitPaths: string[] = [];
