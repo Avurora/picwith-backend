@@ -41,6 +41,26 @@ async function resizeForApi(buf: Buffer, maxPx = 512): Promise<Buffer> {
     .toBuffer();
 }
 
+// 無料プランの各セルに "PicWith" ウォーターマークを合成
+async function addWatermark(buf: Buffer): Promise<Buffer> {
+  const { width = 512, height = 512 } = await sharp(buf).metadata();
+  const fontSize = Math.round(Math.min(width, height) * 0.07);
+  const pad = Math.round(fontSize * 0.65);
+  // SVGで右下にテキスト描画
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">
+    <text
+      x="${width - pad}" y="${height - pad}"
+      font-family="Arial, Helvetica, sans-serif"
+      font-size="${fontSize}px" font-weight="bold"
+      fill="rgba(255,255,255,0.60)" text-anchor="end"
+    >PicWith</text>
+  </svg>`;
+  return sharp(buf)
+    .composite([{ input: Buffer.from(svg), top: 0, left: 0 }])
+    .jpeg({ quality: 90 })
+    .toBuffer();
+}
+
 // 分割 + オプションで2倍アップスケール
 async function splitImage(
   buf: Buffer,
@@ -254,7 +274,11 @@ router.post('/', async (req: Request, res: Response) => {
       .upload(collagePath, collageBuffer, { contentType: 'image/jpeg' });
 
     // ── 分割 & アップスケール ───────────────────────────────────
-    const cellBuffers = await splitImage(collageBuffer, grid.cols, grid.rows, grid.w, grid.h);
+    const rawCellBuffers = await splitImage(collageBuffer, grid.cols, grid.rows, grid.w, grid.h);
+    // 無料プランは各セルにウォーターマークを合成（SNS拡散でブランド露出）
+    const cellBuffers = isFree
+      ? await Promise.all(rawCellBuffers.map(addWatermark))
+      : rawCellBuffers;
 
     const splitPaths: string[] = [];
     for (let i = 0; i < cellBuffers.length; i++) {
