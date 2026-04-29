@@ -213,28 +213,33 @@ router.post('/', async (req: Request, res: Response) => {
       framePath = FRAME_HEIGHT;
     }
 
-    // ── 場所写真を Storage 保存（オリジナルサイズで保存）──────────
     const inputBuffer = Buffer.from(inputImageBase64, 'base64');
     const ts = Date.now();
     const uid = userId ?? 'trial';
     const inputPath = `${uid}/${ts}_input.jpg`;
-    await supabase.storage.from('input-photos')
-      .upload(inputPath, inputBuffer, { contentType: 'image/jpeg' });
-
-    // ── 一時ファイル準備（全プラン: 512px以下にリサイズしてAPI転送量を削減）
     const tmpDir = os.tmpdir();
-    const inputFile = path.join(tmpDir, `input_${ts}.jpg`);
-    const resizedInput = await resizeForApi(inputBuffer, 512);
-    fs.writeFileSync(inputFile, resizedInput);
 
-    // 無料プランは人物写真を1枚に制限
+    // ── 入力画像の Storage保存 / リサイズ / 人物写真リサイズ を並列実行 ──
     const limitedPhotos = isFree ? personPhotoBase64s.slice(0, 1) : personPhotoBase64s;
 
+    const [resizedInput, ...resizedPersons] = await Promise.all([
+      resizeForApi(inputBuffer, 512),
+      ...limitedPhotos.map(b64 => resizeForApi(Buffer.from(b64, 'base64'), 512)),
+    ]);
+
+    // Storage保存（APIとは独立しているので並列化可能）
+    // ※ awaitせず後でPromise.allで回収
+    const inputUploadPromise = supabase.storage.from('input-photos')
+      .upload(inputPath, inputBuffer, { contentType: 'image/jpeg' });
+
+    // 一時ファイルへ書き出し
+    const inputFile = path.join(tmpDir, `input_${ts}.jpg`);
+    fs.writeFileSync(inputFile, resizedInput);
+
     const personFiles: string[] = [];
-    for (let i = 0; i < limitedPhotos.length; i++) {
-      const personBuf = await resizeForApi(Buffer.from(limitedPhotos[i], 'base64'), 512);
+    for (let i = 0; i < resizedPersons.length; i++) {
       const f = path.join(tmpDir, `person_${ts}_${i}.jpg`);
-      fs.writeFileSync(f, personBuf);
+      fs.writeFileSync(f, resizedPersons[i]);
       personFiles.push(f);
     }
 
@@ -267,26 +272,33 @@ router.post('/', async (req: Request, res: Response) => {
     const outputB64 = response.data?.[0]?.b64_json;
     if (!outputB64) throw new Error('画像生成に失敗しました');
 
-    // ── コラージュ保存 ──────────────────────────────────────────
     const collageBuffer = Buffer.from(outputB64, 'base64');
     const collagePath   = `${uid}/${ts}_collage.jpg`;
-    await supabase.storage.from('output-images')
-      .upload(collagePath, collageBuffer, { contentType: 'image/jpeg' });
 
-    // ── 分割 & アップスケール ───────────────────────────────────
-    const rawCellBuffers = await splitImage(collageBuffer, grid.cols, grid.rows, grid.w, grid.h);
-    // 無料プランは各セルにウォーターマークを合成（SNS拡散でブランド露出）
+    // ── コラージュ保存 + 分割 を並列実行 ───────────────────────────
+    const [, rawCellBuffers] = await Promise.all([
+      supabase.storage.from('output-images')
+        .upload(collagePath, collageBuffer, { contentType: 'image/jpeg' }),
+      splitImage(collageBuffer, grid.cols, grid.rows, grid.w, grid.h),
+    ]);
+
+    // 無料プランはウォーターマーク合成（並列）
     const cellBuffers = isFree
       ? await Promise.all(rawCellBuffers.map(addWatermark))
       : rawCellBuffers;
 
-    const splitPaths: string[] = [];
-    for (let i = 0; i < cellBuffers.length; i++) {
-      const splitPath = `${uid}/${ts}_split_${i}.jpg`;
-      await supabase.storage.from('output-images')
-        .upload(splitPath, cellBuffers[i], { contentType: 'image/jpeg' });
-      splitPaths.push(splitPath);
-    }
+    // 分割画像を全て並列アップロード
+    const splitPaths = await Promise.all(
+      cellBuffers.map(async (buf, i) => {
+        const splitPath = `${uid}/${ts}_split_${i}.jpg`;
+        await supabase.storage.from('output-images')
+          .upload(splitPath, buf, { contentType: 'image/jpeg' });
+        return splitPath;
+      })
+    );
+
+    // 入力画像アップロード完了を待機（エラーは無視）
+    await inputUploadPromise.catch(() => {});
 
     // ── DB 記録 ─────────────────────────────────────────────────
     if (isFirstTrial) {
