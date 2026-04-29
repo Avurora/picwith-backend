@@ -22,8 +22,23 @@ const ASSETS = path.join(__dirname, '../../assets');
 const FRAME_WIDE   = path.join(ASSETS, 'frame-wide.jpg');   // 4列×2行
 const FRAME_HEIGHT = path.join(ASSETS, 'frame-height.jpg'); // 2列×4行
 
+// 有料プラン用グリッド
 const GRID_WIDE   = { cols: 4, rows: 2, size: '1536x1024' as const, w: 1536, h: 1024 };
 const GRID_HEIGHT = { cols: 2, rows: 4, size: '1024x1536' as const, w: 1024, h: 1536 };
+// 無料プラン用グリッド（出力サイズを1024×1024に抑えてAPIコスト削減）
+const GRID_WIDE_FREE   = { cols: 4, rows: 2, size: '1024x1024' as const, w: 1024, h: 1024 };
+const GRID_HEIGHT_FREE = { cols: 2, rows: 4, size: '1024x1024' as const, w: 1024, h: 1024 };
+
+// 入力画像をAPI送信前に最大maxPxにリサイズ（全プラン共通・コスト削減）
+async function resizeForApi(buf: Buffer, maxPx = 512): Promise<Buffer> {
+  const { width = 1, height = 1 } = await sharp(buf).metadata();
+  if (width <= maxPx && height <= maxPx) return buf;
+  const scale = maxPx / Math.max(width, height);
+  return sharp(buf)
+    .resize(Math.round(width * scale), Math.round(height * scale))
+    .jpeg({ quality: 85 })
+    .toBuffer();
+}
 
 // 8分割 + オプションで2倍アップスケール
 async function splitImage(
@@ -119,6 +134,9 @@ router.post('/', async (req: Request, res: Response) => {
     }
     if (userId) quality = plan === 'matsu' ? 'high' : 'medium';
 
+    // 無料プラン判定（ゲスト or ログイン済みfreeプラン）
+    const isFree = !userId || plan === 'free';
+
     // ── 入力画像の縦横判定 ──────────────────────────────────────
     const inputBuffer = Buffer.from(inputImageBase64, 'base64');
     const { width: imgW = 1, height: imgH = 1 } = await sharp(inputBuffer).metadata();
@@ -126,7 +144,10 @@ router.post('/', async (req: Request, res: Response) => {
     // 縦長入力 → wideフレーム (4×2 → 各セルが縦長)
     // 横長入力 → heightフレーム (2×4 → 各セルが横長)
     const isPortrait = imgH >= imgW;
-    const grid      = isPortrait ? GRID_WIDE   : GRID_HEIGHT;
+    // 無料プランは1024×1024出力でAPIコスト削減
+    const grid      = isPortrait
+      ? (isFree ? GRID_WIDE_FREE   : GRID_WIDE)
+      : (isFree ? GRID_HEIGHT_FREE : GRID_HEIGHT);
     const framePath = isPortrait ? FRAME_WIDE  : FRAME_HEIGHT;
 
     // ── 場所写真を Storage 保存 ──────────────────────────────────
@@ -136,15 +157,20 @@ router.post('/', async (req: Request, res: Response) => {
     await supabase.storage.from('input-photos')
       .upload(inputPath, inputBuffer, { contentType: 'image/jpeg' });
 
-    // ── 一時ファイル準備 ────────────────────────────────────────
+    // ── 一時ファイル準備（全プラン: 512px以下にリサイズしてAPI転送量を削減）
     const tmpDir = os.tmpdir();
     const inputFile = path.join(tmpDir, `input_${ts}.jpg`);
-    fs.writeFileSync(inputFile, inputBuffer);
+    const resizedInput = await resizeForApi(inputBuffer, 512);
+    fs.writeFileSync(inputFile, resizedInput);
+
+    // 無料プランは人物写真を1枚に制限
+    const limitedPhotos = isFree ? personPhotoBase64s.slice(0, 1) : personPhotoBase64s;
 
     const personFiles: string[] = [];
-    for (let i = 0; i < personPhotoBase64s.length; i++) {
+    for (let i = 0; i < limitedPhotos.length; i++) {
+      const personBuf = await resizeForApi(Buffer.from(limitedPhotos[i], 'base64'), 512);
       const f = path.join(tmpDir, `person_${ts}_${i}.jpg`);
-      fs.writeFileSync(f, Buffer.from(personPhotoBase64s[i], 'base64'));
+      fs.writeFileSync(f, personBuf);
       personFiles.push(f);
     }
 
