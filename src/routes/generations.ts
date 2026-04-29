@@ -74,22 +74,46 @@ async function splitImage(
   return cells;
 }
 
-function buildPrompt(cols: number, rows: number): string {
+function buildPrompt(cols: number, rows: number, userRequest?: string): string {
   const total = cols * rows;
-  return [
+  const lines = [
+    // 入力構成の説明
     `You are given: (1) a background location photo, (2) one or more person reference photos, (3) a ${cols}×${rows} checkerboard frame template with alternating orange and teal cells.`,
-    `Generate a single photorealistic image that exactly fills the ${cols}×${rows} grid defined by the checkerboard frame — each colored cell becomes one scene panel.`,
-    `Each of the ${total} panels must show the person from the reference photos naturally present at the location from the background photo.`,
-    `Across all ${total} panels, vary the pose, body language, distance, activity, and interaction with the environment — every panel must look distinctly different.`,
-    `The person's face and physical appearance must closely match the reference photos.`,
-    `Background and lighting must remain consistent with the location photo across all panels.`,
-    `No visible borders, lines, or gaps between panels — fill every cell seamlessly edge to edge.`,
-    `Output must be photorealistic, as if these are genuine photographs taken at that location.`,
-  ].join(' ');
+
+    // 出力品質（入力画像は圧縮済みだが出力は最高品質で）
+    `Generate a single ultra-high-quality, sharp, detailed photorealistic image at maximum fidelity — the input reference photos may be low resolution, but the output must be rendered at the highest possible quality and detail.`,
+
+    // グリッド構造
+    `The output must exactly fill the ${cols}×${rows} grid defined by the checkerboard frame — each colored cell becomes one distinct scene panel, for a total of ${total} panels.`,
+
+    // 人物と背景（背景のシチュエーションは極力変えない）
+    `Each panel must show the person from the reference photos naturally present at the SAME location shown in the background photo. Preserve the background scenery, architecture, lighting, time of day, weather, and atmosphere as faithfully as possible — do NOT replace, alter, or reimagine the environment.`,
+
+    // ポーズのバリエーション（現実的・写真的なバリエーション）
+    `Across all ${total} panels, present diverse and natural pose variations as if taken during a real photo session at that location: vary standing, sitting, crouching, walking, looking in different directions, interacting naturally with the surroundings, and shoot from different distances (close-up portrait, mid-shot, full-body). Every panel must show a clearly different pose or moment.`,
+
+    // 人物の一貫性
+    `The person's face, hair, build, and overall appearance must closely and consistently match the reference photos in every panel.`,
+
+    // リアリズム厳守（非現実的な描写はNG）
+    `All panels must look exactly like genuine photographs shot by a professional photographer at that real location — no illustrations, no paintings, no CGI, no stylized or surreal elements, no fantasy or impossible poses. The output must be completely indistinguishable from real photographs.`,
+
+    // シームレスグリッド
+    `No visible borders, grid lines, or gaps between panels — fill every cell seamlessly edge to edge.`,
+  ];
+
+  // ユーザーのカスタムリクエスト（倫理・アプリ理念に反するものはバックエンドで除外済み）
+  if (userRequest && userRequest.trim().length > 0) {
+    lines.push(
+      `Additional user request — prioritize this when it does not conflict with the above rules: ${userRequest.trim()}`
+    );
+  }
+
+  return lines.join(' ');
 }
 
 router.post('/', async (req: Request, res: Response) => {
-  const { userId, personId, inputImageBase64, personPhotoBase64s, deviceId, orientation } = req.body as {
+  const { userId, personId, inputImageBase64, personPhotoBase64s, deviceId, orientation, userRequest } = req.body as {
     userId: string | null;
     personId: string | null;
     inputImageBase64: string;
@@ -97,7 +121,18 @@ router.post('/', async (req: Request, res: Response) => {
     deviceId: string;
     // 有料プランのみ使用: 'landscape' | 'portrait'（無料プランは常にsquare）
     orientation: 'landscape' | 'portrait' | null;
+    // ユーザーの任意リクエスト（任意）
+    userRequest?: string;
   };
+
+  // 倫理・アプリ理念フィルタ: 暴力・性的・特定人物誹謗等のキーワードを含む場合は除外
+  const BLOCKED_PATTERNS = [
+    /nude|naked|sexual|explicit|porn|violence|violent|kill|blood|weapon|racist|hate|drug/i,
+    /ヌード|裸|性的|暴力|殺|血|差別|ヘイト|薬物/,
+  ];
+  const sanitizedRequest = userRequest && !BLOCKED_PATTERNS.some(p => p.test(userRequest))
+    ? userRequest
+    : undefined;
 
   if (!inputImageBase64 || !deviceId) {
     return res.status(400).json({ error: 'inputImageBase64 と deviceId は必須です' });
@@ -201,7 +236,7 @@ router.post('/', async (req: Request, res: Response) => {
     const response = await openai.images.edit({
       model: 'gpt-image-2',
       image: imageInputs as any,
-      prompt: buildPrompt(grid.cols, grid.rows),
+      prompt: buildPrompt(grid.cols, grid.rows, sanitizedRequest),
       n: 1,
       size: grid.size,
     });
