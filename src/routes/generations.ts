@@ -62,7 +62,7 @@ async function addWatermark(buf: Buffer): Promise<Buffer> {
 }
 
 // 分割 + オプションで2倍アップスケール
-async function splitImage(
+export async function splitImage(
   buf: Buffer,
   cols: number,
   rows: number,
@@ -145,6 +145,129 @@ function buildPrompt(cols: number, rows: number, numPersonPhotos: number, userRe
   return lines.join(' ');
 }
 
+// ────────────────────────────────────────────────────
+// Batch API 用: 画像バッファをOpenAI Files APIにアップロード
+// ────────────────────────────────────────────────────
+async function uploadImageFile(buf: Buffer, filename: string): Promise<string> {
+  const tmpPath = path.join(os.tmpdir(), filename);
+  fs.writeFileSync(tmpPath, buf);
+  try {
+    const fileObj = await openai.files.create({
+      file: await toFile(fs.createReadStream(tmpPath), filename, { type: 'image/jpeg' }),
+      purpose: 'vision',
+    });
+    return fileObj.id;
+  } finally {
+    try { fs.unlinkSync(tmpPath); } catch {}
+  }
+}
+
+// ────────────────────────────────────────────────────
+// Batch API 用: バッチジョブを作成して batch_id を返す
+// ────────────────────────────────────────────────────
+export async function submitBatchJob(params: {
+  generationId: string;
+  resizedInput: Buffer;
+  resizedPersons: Buffer[];
+  framePath: string;
+  grid: typeof GRID_FREE;
+  prompt: string;
+  ts: number;
+}): Promise<string> {
+  const { generationId, resizedInput, resizedPersons, framePath, grid, prompt, ts } = params;
+
+  const frameBuffer = fs.readFileSync(framePath);
+
+  // 全画像を並列でOpenAI Files APIにアップロード
+  const [inputFileId, frameFileId, ...personFileIds] = await Promise.all([
+    uploadImageFile(resizedInput, `bg_${ts}.jpg`),
+    uploadImageFile(frameBuffer, `frame_${ts}.jpg`),
+    ...resizedPersons.map((buf, i) => uploadImageFile(buf, `person_${ts}_${i}.jpg`)),
+  ]);
+
+  // 画像の順序: 背景 → 人物たち → フレーム
+  const imageFileIds = [inputFileId, ...personFileIds, frameFileId];
+
+  // バッチリクエストJSONLを作成
+  const batchRequest = {
+    custom_id: generationId,
+    method: 'POST',
+    url: '/v1/images/edits',
+    body: {
+      model: 'gpt-image-2',
+      image: imageFileIds,
+      prompt,
+      n: 1,
+      size: grid.size,
+    },
+  };
+
+  const tmpJsonl = path.join(os.tmpdir(), `batch_${ts}.jsonl`);
+  fs.writeFileSync(tmpJsonl, JSON.stringify(batchRequest) + '\n');
+
+  try {
+    // JSONLファイルをアップロード
+    const batchFile = await openai.files.create({
+      file: await toFile(fs.createReadStream(tmpJsonl), `batch_${ts}.jsonl`, { type: 'application/jsonl' }),
+      purpose: 'batch',
+    });
+
+    // バッチジョブを作成（images.edit は SDK の型定義に未追加のため any キャスト）
+    const batch = await openai.batches.create({
+      input_file_id: batchFile.id,
+      endpoint: '/v1/images/edits' as any,
+      completion_window: '24h',
+    });
+
+    return batch.id;
+  } finally {
+    try { fs.unlinkSync(tmpJsonl); } catch {}
+  }
+}
+
+// ────────────────────────────────────────────────────
+// Batch完了後の後処理（server.ts のポーリングCronから呼ばれる）
+// ────────────────────────────────────────────────────
+export async function processBatchOutput(params: {
+  generationId: string;
+  userId: string;
+  outputB64: string;
+}): Promise<void> {
+  const { generationId, userId, outputB64 } = params;
+  const ts = Date.now();
+
+  const collageBuffer = Buffer.from(outputB64, 'base64');
+  const collagePath = `${userId}/${ts}_collage.jpg`;
+
+  // コラージュ保存 + 分割を並列実行
+  const [, rawCellBuffers] = await Promise.all([
+    supabase.storage.from('output-images').upload(collagePath, collageBuffer, { contentType: 'image/jpeg' }),
+    splitImage(collageBuffer, GRID_FREE.cols, GRID_FREE.rows, GRID_FREE.w, GRID_FREE.h),
+  ]);
+
+  // 無料プランはウォーターマーク合成
+  const cellBuffers = await Promise.all(rawCellBuffers.map(addWatermark));
+
+  // 分割画像を並列アップロード
+  const splitPaths = await Promise.all(
+    cellBuffers.map(async (buf, i) => {
+      const splitPath = `${userId}/${ts}_split_${i}.jpg`;
+      await supabase.storage.from('output-images').upload(splitPath, buf, { contentType: 'image/jpeg' });
+      return splitPath;
+    })
+  );
+
+  // DBを更新
+  await supabase.from('generations').update({
+    output_path: collagePath,
+    split_paths: JSON.stringify(splitPaths),
+    batch_status: 'completed',
+  }).eq('id', generationId);
+}
+
+// ────────────────────────────────────────────────────
+// メインルート: POST /generations
+// ────────────────────────────────────────────────────
 router.post('/', async (req: Request, res: Response) => {
   const { userId, personId, inputImageBase64, personPhotoBase64s, deviceId, orientation, userRequest } = req.body as {
     userId: string | null;
@@ -210,7 +333,6 @@ router.post('/', async (req: Request, res: Response) => {
     const isFree = !userId || plan === 'free';
 
     // ── グリッド・フレーム決定 ────────────────────────────────────
-    // 無料: 正方形2×2（4枚）/ 有料: ユーザー選択の横長or縦長（8枚）
     let grid: typeof GRID_FREE | typeof GRID_WIDE | typeof GRID_HEIGHT;
     let framePath: string;
 
@@ -221,7 +343,6 @@ router.post('/', async (req: Request, res: Response) => {
       grid = GRID_WIDE;
       framePath = FRAME_WIDE;
     } else {
-      // デフォルトは縦長
       grid = GRID_HEIGHT;
       framePath = FRAME_HEIGHT;
     }
@@ -230,9 +351,8 @@ router.post('/', async (req: Request, res: Response) => {
     const ts = Date.now();
     const uid = userId ?? 'trial';
     const inputPath = `${uid}/${ts}_input.jpg`;
-    const tmpDir = os.tmpdir();
 
-    // ── 入力画像の Storage保存 / リサイズ / 人物写真リサイズ を並列実行 ──
+    // ── 入力画像リサイズ + 人物写真リサイズ を並列実行 ──
     const limitedPhotos = isFree ? personPhotoBase64s.slice(0, 1) : personPhotoBase64s;
 
     const [resizedInput, ...resizedPersons] = await Promise.all([
@@ -240,12 +360,80 @@ router.post('/', async (req: Request, res: Response) => {
       ...limitedPhotos.map(b64 => resizeForApi(Buffer.from(b64, 'base64'), 512)),
     ]);
 
-    // Storage保存（APIとは独立しているので並列化可能）
-    // ※ awaitせず後でPromise.allで回収
+    // Storage保存（APIとは独立）
     const inputUploadPromise = supabase.storage.from('input-photos')
       .upload(inputPath, inputBuffer, { contentType: 'image/jpeg' });
 
-    // 一時ファイルへ書き出し
+    const prompt = buildPrompt(grid.cols, grid.rows, resizedPersons.length, sanitizedRequest);
+
+    // ── 使用量カウントアップ（先に+1してからAPIを呼ぶ）──────────────
+    if (isFirstTrial) {
+      await supabase.from('device_trials').insert({
+        device_id: deviceId,
+        used_at: new Date().toISOString(),
+      });
+    }
+
+    let newCount = currentCount;
+    if (userId && usageRow) {
+      newCount = currentCount + 1;
+      await supabase.from('monthly_usage')
+        .update({ count: newCount, updated_at: new Date().toISOString() })
+        .eq('user_id', userId).eq('year_month', yearMonth);
+    } else if (userId) {
+      newCount = 1;
+      await supabase.from('monthly_usage')
+        .insert({ user_id: userId, year_month: yearMonth, count: 1 });
+    }
+
+    const remaining = userId ? limit - newCount : 0;
+
+    // ── 無料プラン（ログイン済み）: Batch API で非同期生成 ───────────
+    if (isFree && userId) {
+      // generationsにpendingレコードを先行挿入
+      const { data: generation } = await supabase.from('generations').insert({
+        user_id: userId,
+        person_id: personId ?? null,
+        input_path: inputPath,
+        output_path: null,
+        split_paths: null,
+        quality,
+        batch_status: 'pending',
+      }).select().single();
+
+      const generationId = (generation as any)?.id;
+      if (!generationId) throw new Error('generation ID の取得に失敗しました');
+
+      // バッチジョブを投入（エラーがあればステータスをfailedに更新）
+      submitBatchJob({ generationId, resizedInput, resizedPersons, framePath: framePath as typeof FRAME_SQUARE, grid: GRID_FREE, prompt, ts })
+        .then(batchId => {
+          supabase.from('generations')
+            .update({ openai_batch_id: batchId })
+            .eq('id', generationId)
+            .then(() => {});
+        })
+        .catch(e => {
+          console.error('[batch] バッチ投入エラー:', e);
+          supabase.from('generations')
+            .update({ batch_status: 'failed' })
+            .eq('id', generationId)
+            .then(() => {});
+        });
+
+      inputUploadPromise.catch(() => {});
+
+      // 即座にレスポンス返却（クライアントはホームに戻れる）
+      return res.status(202).json({
+        generationId,
+        outputUrls: [],
+        remaining,
+        isFirstTrial,
+        status: 'pending',
+      });
+    }
+
+    // ── ゲストユーザー or 有料プラン: 同期生成 ──────────────────────
+    const tmpDir = os.tmpdir();
     const inputFile = path.join(tmpDir, `input_${ts}.jpg`);
     fs.writeFileSync(inputFile, resizedInput);
 
@@ -256,9 +444,7 @@ router.post('/', async (req: Request, res: Response) => {
       personFiles.push(f);
     }
 
-    // ── gpt-image-2 呼び出し ────────────────────────────────────
     const imageInputs: Awaited<ReturnType<typeof toFile>>[] = [];
-
     imageInputs.push(
       await toFile(fs.createReadStream(inputFile), 'background.jpg', { type: 'image/jpeg' })
     );
@@ -274,12 +460,11 @@ router.post('/', async (req: Request, res: Response) => {
     const response = await openai.images.edit({
       model: 'gpt-image-2',
       image: imageInputs as any,
-      prompt: buildPrompt(grid.cols, grid.rows, personFiles.length, sanitizedRequest),
+      prompt,
       n: 1,
       size: grid.size,
     });
 
-    // 一時ファイル削除
     [inputFile, ...personFiles].forEach(f => { try { fs.unlinkSync(f); } catch {} });
 
     const outputB64 = response.data?.[0]?.b64_json;
@@ -288,19 +473,18 @@ router.post('/', async (req: Request, res: Response) => {
     const collageBuffer = Buffer.from(outputB64, 'base64');
     const collagePath   = `${uid}/${ts}_collage.jpg`;
 
-    // ── コラージュ保存 + 分割 を並列実行 ───────────────────────────
     const [, rawCellBuffers] = await Promise.all([
       supabase.storage.from('output-images')
         .upload(collagePath, collageBuffer, { contentType: 'image/jpeg' }),
       splitImage(collageBuffer, grid.cols, grid.rows, grid.w, grid.h),
     ]);
 
-    // 無料プランはウォーターマーク合成（並列）
-    const cellBuffers = isFree
+    // ゲストユーザーのみウォーターマーク（有料プランはなし）
+    const isGuestFree = !userId;
+    const cellBuffers = isGuestFree
       ? await Promise.all(rawCellBuffers.map(addWatermark))
       : rawCellBuffers;
 
-    // 分割画像を全て並列アップロード
     const splitPaths = await Promise.all(
       cellBuffers.map(async (buf, i) => {
         const splitPath = `${uid}/${ts}_split_${i}.jpg`;
@@ -310,25 +494,7 @@ router.post('/', async (req: Request, res: Response) => {
       })
     );
 
-    // 入力画像アップロード完了を待機（エラーは無視）
     await inputUploadPromise.catch(() => {});
-
-    // ── DB 記録 ─────────────────────────────────────────────────
-    if (isFirstTrial) {
-      await supabase.from('device_trials').insert({
-        device_id: deviceId,
-        used_at: new Date().toISOString(),
-      });
-    }
-
-    if (userId && usageRow) {
-      await supabase.from('monthly_usage')
-        .update({ count: currentCount + 1, updated_at: new Date().toISOString() })
-        .eq('user_id', userId).eq('year_month', yearMonth);
-    } else if (userId) {
-      await supabase.from('monthly_usage')
-        .insert({ user_id: userId, year_month: yearMonth, count: 1 });
-    }
 
     const { data: generation } = userId
       ? await supabase.from('generations').insert({
@@ -338,20 +504,20 @@ router.post('/', async (req: Request, res: Response) => {
           output_path: collagePath,
           split_paths: JSON.stringify(splitPaths),
           quality,
+          batch_status: null,
         }).select().single()
       : { data: null };
 
-    // ── レスポンス ──────────────────────────────────────────────
     const splitUrls = splitPaths.map(p =>
       supabase.storage.from('output-images').getPublicUrl(p).data.publicUrl
     );
-    const remaining = userId ? limit - (currentCount + 1) : 0;
 
     return res.json({
-      generationId: generation?.id ?? null,
+      generationId: (generation as any)?.id ?? null,
       outputUrls: splitUrls,
       remaining,
       isFirstTrial,
+      status: 'completed',
     });
 
   } catch (e: any) {
