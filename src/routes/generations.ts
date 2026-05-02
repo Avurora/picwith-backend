@@ -189,13 +189,14 @@ export async function submitBatchJob(params: {
   const imageFileIds = [inputFileId, ...personFileIds, frameFileId];
 
   // バッチリクエストJSONLを作成
+  // JSON形式のBatch APIでは 'images'（複数）が正しいパラメータ名
   const batchRequest = {
     custom_id: generationId,
     method: 'POST',
     url: '/v1/images/edits',
     body: {
       model: 'gpt-image-2',
-      image: imageFileIds,
+      images: imageFileIds,
       prompt,
       n: 1,
       size: grid.size,

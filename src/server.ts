@@ -160,6 +160,21 @@ async function pollBatchJobs() {
     try {
       const batch = await openai.batches.retrieve(gen.openai_batch_id);
 
+      // バッチ内リクエストが全て失敗した場合（output_file_idなし・error_file_idあり）
+      if (batch.status === 'completed' && !batch.output_file_id && (batch as any).error_file_id) {
+        console.error(`[batch-poll] 全リクエスト失敗 (${gen.id}): error_file_id=${(batch as any).error_file_id}`);
+        await supabase.from('generations')
+          .update({ batch_status: 'failed' })
+          .eq('id', gen.id);
+        await sendPushNotification(
+          gen.user_id,
+          '⚠️ 生成に失敗しました',
+          'もう一度お試しください',
+          {}
+        );
+        continue;
+      }
+
       if (batch.status === 'completed' && batch.output_file_id) {
         // バッチ出力ファイルをダウンロード
         const outputFileResp = await openai.files.content(batch.output_file_id);
