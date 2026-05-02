@@ -105,7 +105,7 @@ function buildPrompt(cols: number, rows: number, numPersonPhotos: number, userRe
     `IMAGE ROLES — follow these assignments strictly:`,
     `• image 1 (background.jpg): the LOCATION photo. This defines the scene, environment, architecture, lighting, time of day, and atmosphere. Do NOT change any of these.`,
     numPersonPhotos > 0
-      ? `• ${personRange} PERSON REFERENCE photo(s). Use ALL of them to faithfully reconstruct this specific individual — match their face shape, eyes, nose, mouth, skin tone, hair color, hairstyle, and body proportions EXACTLY. This person must appear identically across every panel.`
+      ? `• ${personRange} PERSON REFERENCE photo(s). Use these ONLY to reconstruct the person's FACE (face shape, eyes, nose, mouth, skin tone) and body build/proportions. DO NOT copy their clothing, outfit, or hairstyle from the reference photos — these should be freely varied across panels.`
       : null,
     `• last image (frame.jpg): the ${cols}×${rows} GRID TEMPLATE with alternating orange and teal cells. Each cell defines one output panel boundary — do not let content bleed between cells.`,
   ].filter(Boolean).join(' ');
@@ -125,8 +125,11 @@ function buildPrompt(cols: number, rows: number, numPersonPhotos: number, userRe
     // ポーズのバリエーション（現実的・写真的なバリエーション）
     `Across all ${total} panels, present diverse and natural pose variations as if shot during a professional photo session at that location: vary standing, sitting, crouching, walking, looking in different directions, interacting naturally with the surroundings, and use different camera distances (close-up portrait, mid-shot, full-body). Every panel must show a clearly different pose or moment.`,
 
-    // 人物の一貫性（再現性の強調）
-    `CRITICAL: The person's identity must be consistent and faithful in every single panel. Reproduce the face, skin tone, hair, and body with high accuracy from the reference photos. Do not generalize or average their appearance — match this specific individual.`,
+    // 人物の一貫性（顔・肌のみ。服装・髪型はバリエーションを出す）
+    `CRITICAL — FACE CONSISTENCY: The person's face and skin tone must be recognizable and consistent across every panel — faithfully reproduce their facial features (eyes, nose, mouth, face shape) from the reference. Do NOT lock in the clothing or hairstyle from the reference photos.`,
+
+    // 服装・髪型の多様化
+    `OUTFIT & HAIRSTYLE VARIETY: Each panel must feature a DIFFERENT outfit and hairstyle — as if this person was photographed on multiple occasions wearing completely different clothes and styling their hair differently. Vary the clothing style (casual, smart-casual, sporty, etc.), colors, and hairstyle (tied up, down, different length impression, accessories) freely across panels. The outfits should suit the location's atmosphere.`,
 
     // リアリズム厳守（非現実的な描写はNG）
     `All panels must look exactly like genuine photographs shot by a professional photographer at that real location — no illustrations, no paintings, no CGI, no stylized or surreal elements, no fantasy or impossible poses. The output must be completely indistinguishable from real photographs.`,
